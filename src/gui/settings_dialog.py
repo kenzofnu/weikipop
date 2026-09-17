@@ -534,6 +534,44 @@ class SettingsDialog(QDialog):
         self.anki_screenshot_check.setChecked(getattr(config, "enable_screenshot", False))
         anki_layout.addRow("Enable Screenshot:", self.anki_screenshot_check)
 
+        self.anki_audio_check = QCheckBox()
+        self.anki_audio_check.setChecked(getattr(config, "enable_audio", True))
+        anki_layout.addRow("Enable Audio (JapanesePod101):", self.anki_audio_check)
+
+        self.anki_sentence_audio_check = QCheckBox()
+        self.anki_sentence_audio_check.setChecked(getattr(config, "enable_sentence_audio", False))
+        self.anki_sentence_audio_check.setToolTip(
+            "Capture the last few seconds of system audio (drama/anime/game) and "
+            "attach it to the field mapped to {sentence-audio}. Windows only."
+        )
+        anki_layout.addRow("Enable Sentence Audio (system capture):", self.anki_sentence_audio_check)
+
+        self.anki_sentence_audio_duration = QDoubleSpinBox()
+        self.anki_sentence_audio_duration.setRange(1.0, 30.0)
+        self.anki_sentence_audio_duration.setSingleStep(0.5)
+        self.anki_sentence_audio_duration.setSuffix(" s")
+        self.anki_sentence_audio_duration.setValue(float(getattr(config, "sentence_audio_duration", 6.0)))
+        anki_layout.addRow("Sentence Audio Duration:", self.anki_sentence_audio_duration)
+
+        self.anki_sentence_audio_offset = QDoubleSpinBox()
+        self.anki_sentence_audio_offset.setRange(0.0, 10.0)
+        self.anki_sentence_audio_offset.setSingleStep(0.1)
+        self.anki_sentence_audio_offset.setSuffix(" s")
+        self.anki_sentence_audio_offset.setToolTip(
+            "How far back from 'now' the captured window ends. Increase if the "
+            "clip cuts off too late (captures UI sounds after the line)."
+        )
+        self.anki_sentence_audio_offset.setValue(float(getattr(config, "sentence_audio_offset", 0.3)))
+        anki_layout.addRow("Sentence Audio End Offset:", self.anki_sentence_audio_offset)
+
+        self.anki_sentence_audio_trim_check = QCheckBox()
+        self.anki_sentence_audio_trim_check.setChecked(getattr(config, "sentence_audio_trim_silence", True))
+        self.anki_sentence_audio_trim_check.setToolTip(
+            "Snap the clip to the last real sound, skipping the silent gap after "
+            "you pause. Recommended for the 'pause, then mine' workflow."
+        )
+        anki_layout.addRow("Trim Silence (snap to last audio):", self.anki_sentence_audio_trim_check)
+
         self.anki_meikipop_tag_check = QCheckBox()
         self.anki_meikipop_tag_check.setChecked(getattr(config, "add_meikipop_tag", True))
         anki_layout.addRow("Tag with 'weikipop':", self.anki_meikipop_tag_check)
@@ -914,7 +952,27 @@ class SettingsDialog(QDialog):
         config.model_name            = self.anki_model_combo.currentText().strip() or "Basic"
         config.prevent_duplicates    = self.anki_prevent_dup_check.isChecked()
         config.enable_screenshot     = self.anki_screenshot_check.isChecked()
+        config.enable_audio          = self.anki_audio_check.isChecked()
+        config.enable_sentence_audio = self.anki_sentence_audio_check.isChecked()
+        config.sentence_audio_duration = self.anki_sentence_audio_duration.value()
+        config.sentence_audio_offset = self.anki_sentence_audio_offset.value()
+        config.sentence_audio_trim_silence = self.anki_sentence_audio_trim_check.isChecked()
         config.add_meikipop_tag      = self.anki_meikipop_tag_check.isChecked()
+
+        # Start/stop the rolling audio recorder to match the toggle, so the
+        # change takes effect without an app restart.
+        try:
+            from src.utils.audio_capture import recorder
+            if config.enable_sentence_audio:
+                buf = max(15.0, float(config.sentence_audio_duration)
+                          + float(config.sentence_audio_offset) + 10.0)
+                recorder.buffer_seconds = buf
+                recorder._max_frames = int(recorder.samplerate * buf)
+                recorder.start()
+            else:
+                recorder.stop()
+        except Exception:
+            pass
         config.add_document_title_tag = self.anki_doc_title_tag_check.isChecked()
         config.anki_field_map = {
             field: combo.currentText()
@@ -956,10 +1014,15 @@ class SettingsDialog(QDialog):
         "{glossary}",          # all definitions
         "{glossary-brief}",    # compact definitions
         "{sentence}",          # sentence the word appeared in
+        "{sentence-audio}",    # captured system audio (drama/anime/game)
         "{document-title}",    # title of source window
         "{tags}",              # part-of-speech / grammar tags
         "{frequencies}",       # frequency rank
+        "{frequency-harmonic-rank}",  # frequency for sorting (JPMN FreqSort)
         "{conjugation}",       # conjugation path (e.g. past > polite)
+        "{pitch-accent-positions}",   # downstep number(s), e.g. 0 / 1,3 (JPMN PitchPosition)
+        "{pitch-accent-graphs}",      # rendered pitch-accent diagram(s) (SVG)
+        "{pitch-accent-categories}",  # heiban / atamadaka / nakadaka / odaka
     ]
 
     def _anki_invoke(self, action: str, **params):

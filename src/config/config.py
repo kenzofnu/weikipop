@@ -2,6 +2,7 @@
 import configparser
 import json
 import logging
+import os
 import sys
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,11 @@ class Config:
             'add_meikipop_tag': True,
             'add_document_title_tag': True,
             'enable_screenshot': False,
+            'enable_audio': True,
+            'enable_sentence_audio': False,
+            'sentence_audio_duration': 6.0,
+            'sentence_audio_offset': 0.3,
+            'sentence_audio_trim_silence': True,
             'prevent_duplicates': True,
             'field_map': '{"Expression": "{expression}", "ExpressionFurigana": "{furigana-plain}", "ExpressionReading": "{reading}", "ExpressionAudio": "{audio}", "MainDefinition": "{glossary-first}", "Sentence": "{cloze-prefix}<b>{cloze-body}</b>{cloze-suffix}", "PitchPosition": "{pitch-accent-positions}", "FreqSort": "{frequency-harmonic-rank}", "MiscInfo": "{document-title}"}',
             'duplicate_check_fields': 'Front,Word,Expression,Vocab,Kanji,Reading,Furigana,Writing,Term,Vocabulary',
@@ -85,9 +91,28 @@ class Config:
             cls._instance._load()
         return cls._instance
 
+    @staticmethod
+    def config_path() -> str:
+        """Persistent config.ini path in the per-user data dir.
+
+        Migrates a legacy config.ini sitting next to the executable (the old
+        behaviour) into the user data dir on first run, so existing settings
+        are preserved.
+        """
+        from src.utils.paths import user_data_path
+        path = user_data_path('config.ini')
+        if not os.path.exists(path) and os.path.exists('config.ini'):
+            try:
+                import shutil
+                shutil.copyfile('config.ini', path)
+                logger.info("Migrated config.ini to user data dir: %s", path)
+            except Exception as e:
+                logger.warning("Could not migrate config.ini: %s", e)
+        return path
+
     def _load(self):
         parser = configparser.ConfigParser()
-        parser.read('config.ini', encoding='utf-8')
+        parser.read(self.config_path(), encoding='utf-8')
 
         for section, settings in self._SCHEMA.items():
             for key, default in settings.items():
@@ -176,9 +201,9 @@ class Config:
                     val = getattr(self, 'yomitan_api_url', 'http://127.0.0.1:19633')
                 parser.set(section, key, str(val).lower() if isinstance(val, bool) else str(val))
 
-        with open('config.ini', 'w', encoding='utf-8') as f:
+        with open(self.config_path(), 'w', encoding='utf-8') as f:
             parser.write(f)
-        logger.info("Settings saved to config.ini.")
+        logger.info("Settings saved to %s", self.config_path())
 
 
 config = Config()

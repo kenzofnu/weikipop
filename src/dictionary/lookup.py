@@ -1,10 +1,12 @@
 # lookup.py - Optimized version
+import json
 import logging
 import math
 import os
 import pickle
 import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -30,6 +32,56 @@ JAPANESE_SEPARATORS = {
 logger = logging.getLogger(__name__)
 
 
+def _pos_family(tag: str) -> str:
+    """Collapse a JMdict/Yomitan inflection code to its coarse family so the
+    deconjugator's fine codes (v5s, v5m, v5k-s) match a dictionary that only
+    stores the coarse rule (v5). Non-inflection tags pass through unchanged."""
+    if not tag:
+        return tag
+    if tag.startswith('v5'):
+        return 'v5'
+    if tag.startswith('v1'):
+        return 'v1'
+    if tag.startswith('vs'):
+        return 'vs'
+    if tag.startswith('vz'):
+        return 'vz'
+    if tag.startswith('adj-i'):
+        return 'adj-i'
+    return tag
+
+
+def _load_bundled_deconjugator_rules() -> list:
+    """Load deconjugation rules from data/deconjugator.json.
+
+    Used as a fallback when no loaded dictionary provides rules (e.g. when the
+    user's main dictionary is an imported Yomitan dict and there is no
+    dictionary.pkl). Without these rules, conjugated verbs/adjectives never
+    reduce to their dictionary form, so lookups (and pitch/frequency, which key
+    on the lemma) fail for any inflected word. Resolves the path both in dev and
+    inside a PyInstaller bundle (sys._MEIPASS).
+    """
+    candidates = []
+    base = getattr(sys, '_MEIPASS', None)
+    if base:
+        candidates.append(os.path.join(base, 'data', 'deconjugator.json'))
+    candidates.append(os.path.join(os.path.abspath('.'), 'data', 'deconjugator.json'))
+    candidates.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), 'data', 'deconjugator.json'))
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    rules = [r for r in json.load(f) if isinstance(r, dict)]
+                if rules:
+                    logger.info("Loaded %d deconjugator rules from '%s'", len(rules), path)
+                    return rules
+        except Exception as e:
+            logger.warning("Failed to read deconjugator rules from '%s': %s", path, e)
+    logger.warning("No deconjugator rules found — conjugated words will not be detected.")
+    return []
+
+
 @dataclass
 class DictionaryEntry:
     id: int
@@ -42,6 +94,7 @@ class DictionaryEntry:
     match_len: int = 0  # Add match_len field for Yomitan entries
     dictionary_name: str = ''
     dictionary_id: str = ''
+    pitch_positions: tuple = ()  # downstep positions from a pitch-accent dict
 
 
 @dataclass
@@ -75,8 +128,10 @@ class Lookup(threading.Thread):
         self.last_hit_result = None
         self._dict_lock = threading.RLock()
 
-        self.user_dictionary_dir = Path('user_dictionaries')
-        self.user_dictionary_dir.mkdir(exist_ok=True)
+        from src.utils.paths import user_data_path
+        self.user_dictionary_dir = Path(user_data_path('user_dictionaries'))
+        self.user_dictionary_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_user_dictionaries()
 
         # entry_id -> source metadata
         self.entry_sources: Dict[int, Dict[str, Any]] = {}
@@ -110,6 +165,45 @@ class Lookup(threading.Thread):
                 self._yomitan_enabled = False  # Disable permanently if creation fails
                 return None
         return self._yomitan_client
+
+    def _migrate_legacy_user_dictionaries(self):
+        """Copy dictionaries from a legacy ./user_dictionaries folder (next to
+        the exe) into the persistent user data dir and repoint config paths, so
+        rebuilding/replacing the exe no longer loses imported dictionaries."""
+        try:
+            legacy = Path('user_dictionaries').resolve()
+            target = self.user_dictionary_dir.resolve()
+            if not legacy.exists() or legacy == target:
+                return
+
+            for pkl in legacy.glob('*.pkl'):
+                dest = target / pkl.name
+                if not dest.exists():
+                    try:
+                        shutil.copyfile(pkl, dest)
+                    except Exception as e:
+                        logger.warning("Failed migrating dictionary '%s': %s", pkl.name, e)
+
+            # Repoint any config source paths that referenced the legacy folder.
+            sources = getattr(config, 'dictionary_sources', []) or []
+            changed = False
+            for source in sources:
+                p = source.get('path', '')
+                if not p:
+                    continue
+                try:
+                    rp = Path(p).resolve()
+                except Exception:
+                    continue
+                if rp.parent == legacy:
+                    source['path'] = str(target / rp.name)
+                    changed = True
+            if changed:
+                config.dictionary_sources = sources
+                config.save()
+                logger.info("Repointed dictionary sources to user data dir.")
+        except Exception as e:
+            logger.warning("Legacy dictionary migration skipped: %s", e)
 
     def clear_cache(self):
         with self._dict_lock:
@@ -265,6 +359,8 @@ class Lookup(threading.Thread):
             combined_entries: Dict[int, list] = {}
             combined_lookup_map: Dict[str, list] = {}
             combined_kanji_entries: Dict[str, dict] = {}
+            combined_pitch_map: Dict[tuple, list] = {}
+            combined_freq_map: Dict[tuple, int] = {}
             combined_deconj_rules: list[dict] = []
             self.entry_sources = {}
 
@@ -335,6 +431,19 @@ class Lookup(threading.Thread):
                 if not combined_kanji_entries and dictionary.kanji_entries:
                     combined_kanji_entries = dictionary.kanji_entries
 
+                # Merge pitch-accent data across all dictionaries. Keyed by
+                # (term, reading) surface text, so no entry-id remapping needed.
+                for pkey, positions in (getattr(dictionary, 'pitch_map', {}) or {}).items():
+                    bucket = combined_pitch_map.setdefault(pkey, [])
+                    for pos in positions:
+                        if pos not in bucket:
+                            bucket.append(pos)
+
+                # Merge frequency data; keep the best (lowest) rank per key.
+                for fkey, rank in (getattr(dictionary, 'freq_map', {}) or {}).items():
+                    if fkey not in combined_freq_map or rank < combined_freq_map[fkey]:
+                        combined_freq_map[fkey] = rank
+
                 if not combined_deconj_rules and dictionary.deconjugator_rules:
                     combined_deconj_rules = dictionary.deconjugator_rules
 
@@ -344,6 +453,8 @@ class Lookup(threading.Thread):
             self.dictionary.entries = combined_entries
             self.dictionary.lookup_map = combined_lookup_map
             self.dictionary.kanji_entries = combined_kanji_entries
+            self.dictionary.pitch_map = combined_pitch_map
+            self.dictionary.freq_map = combined_freq_map
             self.primary_kanji_entries = combined_kanji_entries
             self.dictionary.deconjugator_rules = combined_deconj_rules or []
             self.dictionary._is_loaded = True
@@ -355,6 +466,11 @@ class Lookup(threading.Thread):
                         self.dictionary.deconjugator_rules = fallback.deconjugator_rules
                 except Exception:
                     pass
+
+            # Final fallback: load rules straight from data/deconjugator.json so
+            # conjugated verbs still deconjugate even without a dictionary.pkl.
+            if not self.dictionary.deconjugator_rules:
+                self.dictionary.deconjugator_rules = _load_bundled_deconjugator_rules()
 
             self.deconjugator = Deconjugator(self.dictionary.deconjugator_rules)
             self.clear_cache()
@@ -572,8 +688,18 @@ class Lookup(threading.Thread):
                     if form.tags:
                         required_pos = form.tags[-1]
                         entry_senses = self.dictionary.entries.get(entry_id, [])
-                        all_pos = {p for s in entry_senses for p in s['pos']}
-                        if required_pos not in all_pos:
+                        # Match against both pos and tags, at fine and coarse
+                        # granularity. The deconjugator emits fine JMdict codes
+                        # (v5s, v5m, v5k-s) while imported Yomitan dicts often
+                        # store only the coarse deinflection rule (v5) in pos and
+                        # keep the fine code in tags — so check both and also
+                        # compare collapsed verb/adjective families.
+                        infl = set()
+                        for s in entry_senses:
+                            infl.update(s.get('pos', []))
+                            infl.update(s.get('tags', []))
+                        if (required_pos not in infl
+                                and _pos_family(required_pos) not in {_pos_family(x) for x in infl}):
                             continue
 
                     if found_primary_match and not KANJI_REGEX.search(prefix):
@@ -593,6 +719,42 @@ class Lookup(threading.Thread):
                         collected[entry_id] = (map_entry, form, prefix_len)
 
         return self._format_and_sort(list(collected.values()), text)
+
+    def _get_pitch_positions(self, written_form: str, reading: str) -> tuple:
+        """Look up downstep positions for a word from the merged pitch map.
+
+        Pitch dictionaries key entries by (expression, reading); the expression
+        may be the kanji form or the kana form, so try the most specific keys
+        first and fall back to reading-only matches.
+        """
+        pm = getattr(self.dictionary, 'pitch_map', None)
+        if not pm:
+            return ()
+        for key in (
+            (written_form, reading),
+            (reading, reading),
+            (written_form, ''),
+            (reading, ''),
+        ):
+            if key[0] and key in pm:
+                return tuple(pm[key])
+        return ()
+
+    def _get_freq(self, written_form: str, reading: str) -> Optional[int]:
+        """Look up a frequency rank from the merged freq map (standalone
+        frequency dictionaries). Tries the most specific keys first."""
+        fm = getattr(self.dictionary, 'freq_map', None)
+        if not fm:
+            return None
+        for key in (
+            (written_form, reading),
+            (reading, reading),
+            (written_form, ''),
+            (reading, ''),
+        ):
+            if key[0] and key in fm:
+                return fm[key]
+        return None
 
     def _get_map_entries(self, text: str) -> List[tuple]:
         result = self.dictionary.lookup_map.get(text, [])
@@ -621,6 +783,12 @@ class Lookup(threading.Thread):
             written = map_entry[WRITTEN_FORM_INDEX]
             reading = map_entry[READING_INDEX] or ''
             freq = map_entry[FREQUENCY_INDEX]
+            # Cross-apply a standalone frequency dictionary to words that don't
+            # already carry a frequency from their own dictionary.
+            if freq >= DEFAULT_FREQ:
+                ext_freq = self._get_freq(written, reading)
+                if ext_freq is not None:
+                    freq = ext_freq
             entry_id = map_entry[ENTRY_ID_INDEX]
             source_meta = self.entry_sources.get(entry_id, {})
             dictionary_name = source_meta.get('dictionary_name', 'Dictionary')
@@ -693,6 +861,7 @@ class Lookup(threading.Thread):
                     match_len=d['match_len'],
                     dictionary_name=d['dictionary_name'],
                     dictionary_id=d['dictionary_id'],
+                    pitch_positions=self._get_pitch_positions(d['written_form'], d['reading']),
                 ))
                 if len(results) >= MAX_DICT_ENTRIES:
                     return results

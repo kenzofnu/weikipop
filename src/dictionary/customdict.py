@@ -42,6 +42,13 @@ class Dictionary:
         # Kanji character entries from kanjidic2: {character: {...}}
         self.kanji_entries: dict[str, dict] = {}
 
+        # Pitch-accent data: {(term, reading): [downstep_positions]}
+        self.pitch_map: dict = {}
+
+        # Frequency data: {(term, reading): rank} — used to cross-apply a
+        # standalone frequency dictionary to words from other dictionaries.
+        self.freq_map: dict = {}
+
         # Deconjugation rules consumed by Deconjugator at runtime
         self.deconjugator_rules: list[dict] = []
 
@@ -58,6 +65,8 @@ class Dictionary:
             self.entries            = data['entries']
             self.lookup_map         = data['lookup_map']
             self.kanji_entries      = data.get('kanji_entries', {})
+            self.pitch_map          = data.get('pitch_map', {})
+            self.freq_map           = data.get('freq_map', {})
             self.deconjugator_rules = data.get('deconjugator_rules', [])
             self._is_loaded = True
             n_refs = sum(len(v) for v in self.lookup_map.values())

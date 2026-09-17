@@ -30,6 +30,31 @@ logger = logging.getLogger(__name__)
 
 MINE_BAR_HEIGHT = 30  # fixed pixel height reserved for the mine status bar
 
+_SMALL_KANA = "ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ"
+
+
+def _count_morae(text: str) -> int:
+    """Count morae in a kana string (small kana attach to the previous mora)."""
+    count = 0
+    i = 0
+    while i < len(text):
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        i += 2 if (nxt and nxt in _SMALL_KANA) else 1
+        count += 1
+    return count
+
+
+def _pitch_category(position: int, reading: str) -> str:
+    """Classify a downstep position into its standard pitch-accent category."""
+    morae = _count_morae(reading)
+    if position == 0:
+        return "heiban"
+    if position == 1:
+        return "atamadaka"
+    if position >= morae:
+        return "odaka"
+    return "nakadaka"
+
 
 class Popup(QWidget):
     # Signals are always delivered on the main thread (AutoConnection) — safe to emit from threads
@@ -525,6 +550,19 @@ class Popup(QWidget):
         conj_str = " > ".join(getattr(entry, "deconjugation_process", ()) or ())
         dict_name = getattr(entry, "dictionary_name", "") or ""
 
+        # Pitch accent (from a loaded Yomitan pitch-accent dictionary)
+        pitch_positions     = getattr(entry, "pitch_positions", ()) or ()
+        pitch_positions_str = ",".join(str(p) for p in pitch_positions)
+        pitch_graphs_html   = ""
+        pitch_categories_str = ""
+        if pitch_positions and reading:
+            try:
+                from src.utils.pitch_renderer import render_pitch_html
+                pitch_graphs_html = " ".join(render_pitch_html(reading, p) for p in pitch_positions)
+            except Exception as e:
+                logger.error(f"Pitch graph render failed: {e}")
+            pitch_categories_str = ",".join(_pitch_category(p, reading) for p in pitch_positions)
+
         # sentence split at cloze boundary (word position)
         cloze_prefix = ""
         cloze_suffix = ""
@@ -559,7 +597,8 @@ class Popup(QWidget):
         # -------------------------------------------------------------------
         data_sources = {
             # ── audio / media ──────────────────────────────────────────────
-            "{audio}":                              "",   # injected separately via AnkiConnect
+            "{audio}":                              "",   # filled by AnkiConnect audio download below
+            "{sentence-audio}":                     "",   # filled by system-audio capture below
             "{clipboard-image}":                    "",   # not available in desktop OCR context
             "{clipboard-text}":                     "",   # not available
             "{picture}":                            "",   # replaced by screenshot injection below
@@ -597,12 +636,12 @@ class Popup(QWidget):
             "{frequency-average-rank}":             freq_str,
             "{frequency-harmonic-occurrence}":      "",   # occurrence-based, not available
             "{frequency-average-occurrence}":       "",
-            # ── pitch accent (not supported) ───────────────────────────────
-            "{pitch-accents}":                      "",
-            "{pitch-accent-graphs}":                "",
-            "{pitch-accent-graphs-jj}":             "",
-            "{pitch-accent-positions}":             "",
-            "{pitch-accent-categories}":            "",
+            # ── pitch accent (from a loaded pitch-accent dictionary) ───────
+            "{pitch-accents}":                      pitch_graphs_html,
+            "{pitch-accent-graphs}":                pitch_graphs_html,
+            "{pitch-accent-graphs-jj}":             pitch_graphs_html,
+            "{pitch-accent-positions}":             pitch_positions_str,
+            "{pitch-accent-categories}":            pitch_categories_str,
             "{phonetic-transcriptions}":            "",
             # ── dictionary meta ────────────────────────────────────────────
             "{dictionary}":                         dict_name,
@@ -689,6 +728,61 @@ class Popup(QWidget):
             except Exception as e:
                 logger.error(f"Screenshot failed: {e}")
 
+        # ── audio injection (JapanesePod101) ───────────────────────────────
+        # AnkiConnect downloads the mp3 server-side and writes [sound:...] into
+        # whichever field the user mapped to {audio}. skipHash matches JPod101's
+        # known "audio not found" placeholder so missing words don't attach junk.
+        if getattr(config, "enable_audio", True) and (word or reading):
+            field_map   = getattr(config, "anki_field_map", {}) or {}
+            audio_field = next(
+                (af for af, src in field_map.items() if src == "{audio}"), None
+            )
+            if audio_field and audio_field in note["fields"]:
+                from urllib.parse import urlencode
+                query = urlencode({"kanji": word or reading, "kana": reading or word})
+                audio_url = (
+                    "https://assets.languagepod101.com/"
+                    f"dictionary/japanese/audiomp3.php?{query}"
+                )
+                safe_name = _re.sub(r"[^\w]+", "_", f"{word}_{reading}").strip("_") or "audio"
+                note.setdefault("audio", []).append({
+                    "url":      audio_url,
+                    "filename": f"weikipop_{safe_name}.mp3",
+                    "skipHash": "7e2c2f954ef6051373ba916f000168dc",
+                    "fields":   [audio_field],
+                })
+
+        # ── sentence audio injection (system loopback capture) ─────────────
+        # Slices the last few seconds of system output (the line you just heard
+        # in the drama/anime/game) from the rolling buffer and attaches it as
+        # base64 WAV to whichever field the user mapped to {sentence-audio}.
+        if getattr(config, "enable_sentence_audio", False):
+            field_map      = getattr(config, "anki_field_map", {}) or {}
+            sent_aud_field = next(
+                (af for af, src in field_map.items() if src == "{sentence-audio}"), None
+            )
+            if sent_aud_field and sent_aud_field in note["fields"]:
+                try:
+                    from src.utils.audio_capture import recorder
+                    if recorder.is_running():
+                        duration = float(getattr(config, "sentence_audio_duration", 6.0))
+                        offset   = float(getattr(config, "sentence_audio_offset", 0.3))
+                        trim     = bool(getattr(config, "sentence_audio_trim_silence", True))
+                        wav = recorder.grab_wav(duration=duration, offset=offset, trim_silence=trim)
+                        if wav:
+                            b64 = base64.b64encode(wav).decode("ascii")
+                            note.setdefault("audio", []).append({
+                                "data":     b64,
+                                "filename": f"weikipop_sentence_{int(time.time())}.wav",
+                                "fields":   [sent_aud_field],
+                            })
+                        else:
+                            logger.warning("Sentence audio buffer empty — nothing captured")
+                    else:
+                        logger.warning("Sentence audio enabled but recorder not running")
+                except Exception as e:
+                    logger.error(f"Sentence audio capture failed: {e}")
+
         try:
             note_id = anki.add_note(note)
             logger.info(f"Added note {note_id} to Anki")
@@ -707,7 +801,8 @@ class Popup(QWidget):
 
     def _append_mining_log(self, entry: DictionaryEntry, ctx: Dict[str, Any], note: Dict[str, Any], note_id: int):
         try:
-            os.makedirs('data', exist_ok=True)
+            from src.utils.paths import user_data_path
+            log_path = user_data_path('mining_log.jsonl')
             glosses = []
             for sense in getattr(entry, 'senses', []) or []:
                 glosses.extend(sense.get('glosses', []))
@@ -726,7 +821,7 @@ class Popup(QWidget):
                     'fields': note.get('fields', {}),
                 },
             }
-            with open('data/mining_log.jsonl', 'a', encoding='utf-8') as file:
+            with open(log_path, 'a', encoding='utf-8') as file:
                 file.write(json.dumps(payload, ensure_ascii=False) + '\n')
         except Exception as exc:
             logger.debug('Failed to append mining log: %s', exc)
@@ -881,6 +976,16 @@ class Popup(QWidget):
                     f' <span style="color:{config.color_highlight_reading};'
                     f'font-size:{config.font_size_header - 2}px;">[{first_entry.reading}]</span>'
                 )
+            pitch_positions = getattr(first_entry, "pitch_positions", ()) or ()
+            if config.show_pitch_accent and pitch_positions and first_entry.reading:
+                try:
+                    from src.utils.pitch_renderer import render_pitch_html
+                    graphs = " ".join(
+                        render_pitch_html(first_entry.reading, p) for p in pitch_positions
+                    )
+                    header_html += f' <span style="vertical-align:bottom;">{graphs}</span>'
+                except Exception as e:
+                    logger.error(f"Pitch graph render failed: {e}")
             if first_entry.deconjugation_process and config.show_deconjugation:
                 dc = " ← ".join(p for p in first_entry.deconjugation_process if p)
                 if dc:

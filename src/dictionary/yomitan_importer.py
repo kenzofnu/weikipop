@@ -119,6 +119,45 @@ def _load_freq_map_from_zip(zf: zipfile.ZipFile) -> dict:
     return freq
 
 
+def _load_pitch_map_from_zip(zf: zipfile.ZipFile) -> dict:
+    """
+    Parse Yomitan pitch-accent meta entries into {(term, reading): [positions]}.
+
+    Yomitan term_meta_bank rows for pitch look like:
+        ["expression", "pitch", {"reading": "かな",
+                                 "pitches": [{"position": 0, ...}, ...]}]
+    """
+    pitch: dict = {}
+    for name in sorted(zf.namelist()):
+        if not re.match(r'term_meta_bank_\d+\.json', Path(name).name):
+            continue
+        with zf.open(name) as file:
+            rows = json.load(file)
+        for row in rows:
+            if len(row) < 3 or row[1] != 'pitch':
+                continue
+            term = row[0]
+            info = row[2]
+            if not isinstance(info, dict):
+                continue
+            reading = info.get('reading', '') or ''
+            positions = []
+            for p in info.get('pitches', []) or []:
+                if isinstance(p, dict) and 'position' in p:
+                    try:
+                        positions.append(int(p['position']))
+                    except (TypeError, ValueError):
+                        continue
+            if not positions:
+                continue
+            key = (term, reading)
+            bucket = pitch.setdefault(key, [])
+            for pos in positions:
+                if pos not in bucket:
+                    bucket.append(pos)
+    return pitch
+
+
 def _has_kanji(text: str) -> bool:
     return any(0x4E00 <= ord(c) <= 0x9FFF for c in text)
 
@@ -132,6 +171,7 @@ def convert_yomitan_zip_to_payload(zip_path: str, dict_index: int = 0) -> Tuple[
             dict_title = index_meta.get('title') or dict_title
 
         freq_map = _load_freq_map_from_zip(zf)
+        pitch_map = _load_pitch_map_from_zip(zf)
 
         rows = []
         for name in sorted(zf.namelist()):
@@ -223,6 +263,8 @@ def convert_yomitan_zip_to_payload(zip_path: str, dict_index: int = 0) -> Tuple[
         'lookup_map': dict(lookup_map),
         'kanji_entries': {},
         'deconjugator_rules': [],
+        'pitch_map': pitch_map,
+        'freq_map': freq_map,
     }
     return payload, dict_title
 
